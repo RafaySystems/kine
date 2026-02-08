@@ -24,12 +24,10 @@ const (
 	oxiaSystemNS     = "oxia-system" // namespace for cluster-scoped resources and revision counter
 )
 
-// clusterScopedResources are etcd key path segments (parts[2]) that denote cluster-scoped resources.
-// Keys like /registry/<this>/<name> go to oxia-system; others with 5+ segments use parts[3] as namespace.
-var clusterScopedResources = map[string]struct{}{
-	"nodes": {}, "namespaces": {}, "clusterroles": {}, "clusterrolebindings": {},
-	"apiservices": {}, "managedclusters": {}, // cluster-scoped; namespaced resources use path /registry/<resource>/<namespace>/<name>
-}
+// Kine/etcd key path convention (Kubernetes registry):
+// - Namespace-scoped: /registry/<resource_type>/namespaces/<ns>/<name> (literal "namespaces" segment).
+// - Cluster-scoped: no "namespaces" segment → e.g. /registry/nodes/worker-1, /registry/<group>/<resource>/<name>.
+// Scope is determined only by the presence of the "namespaces" segment; no hardcoded resource lists needed.
 
 func init() {
 	drivers.Register("oxia", New)
@@ -94,31 +92,33 @@ func newBackend(ctx context.Context, dataSourceName string) (*Backend, error) {
 }
 
 // getOxiaContext maps a Kine/etcd key to (Oxia namespace, storage key).
-// Cluster-scoped: /registry/nodes/node-1 -> ("oxia-system", key unchanged).
-// Namespaced: /registry/pods/tenant-a/vllm-01 -> ("tenant-a", "/registry/pods/vllm-01") to isolate tenants.
+// Uses the standard convention: presence of the literal "namespaces" segment means namespace-scoped.
+//
+// Namespace-scoped: /registry/pods/namespaces/default/my-pod → ("default", "/registry/pods/my-pod")
+// Cluster-scoped:  /registry/nodes/worker-1 or /registry/<group>/<resource>/<name> → ("oxia-system", key)
 func getOxiaContext(key string) (oxiaNamespace, storageKey string) {
 	parts := strings.Split(key, "/")
-	// Must be /registry/<resource>/...
 	if len(parts) < 4 || parts[1] != "registry" {
 		return oxiaSystemNS, key
 	}
-	resource := parts[2]
-	if _, clusterScoped := clusterScopedResources[resource]; clusterScoped {
-		return oxiaSystemNS, key
+	for i, part := range parts {
+		// Skip i==2: that "namespaces" is the resource type (Namespace object key: /registry/namespaces/<name>), which is cluster-scoped.
+		if part == "namespaces" && i > 2 && i+1 < len(parts) {
+			k8sNamespace := parts[i+1]
+			if k8sNamespace == "" {
+				return oxiaSystemNS, key
+			}
+			// Strip the two segments "namespaces" and "<ns>" for storage in that Oxia namespace.
+			stripped := "/registry/" + strings.Join(parts[2:i], "/") + "/" + strings.Join(parts[i+2:], "/")
+			logrus.Debugf("Kine Oxia: namespace-scoped key -> oxia_ns=%q stripped_key=%s", k8sNamespace, stripped)
+			return k8sNamespace, stripped
+		}
 	}
-	// Namespaced: /registry/<resource>/<namespace>/<name...>
-	if len(parts) < 5 {
-		return oxiaSystemNS, key
-	}
-	k8sNamespace := parts[3]
-	if k8sNamespace == "" {
-		return oxiaSystemNS, key
-	}
-	trimmedKey := "/registry/" + resource + "/" + strings.Join(parts[4:], "/")
-	return k8sNamespace, trimmedKey
+	return oxiaSystemNS, key
 }
 
 // fullKeyFromStorage reconstructs the full Kine key from Oxia namespace + storage key.
+// Inserts the literal "namespaces" and the namespace segment back (stored key had them stripped).
 func fullKeyFromStorage(oxiaNamespace, storageKey string) string {
 	if oxiaNamespace == oxiaSystemNS {
 		return storageKey
@@ -127,13 +127,25 @@ func fullKeyFromStorage(oxiaNamespace, storageKey string) string {
 	if len(parts) < 4 || parts[1] != "registry" {
 		return storageKey
 	}
-	resource := parts[2]
-	namePart := strings.Join(parts[3:], "/")
-	return "/registry/" + resource + "/" + oxiaNamespace + "/" + namePart
+	// Stored key is /registry/<prefix>/<name>. Insert "namespaces"/<ns> after prefix.
+	// Prefix length: 1 for core (/registry/pods/...), 2 for grouped (/registry/group/resource/...).
+	insertAfter := 2
+	if strings.Contains(parts[2], ".") && len(parts) >= 5 {
+		insertAfter = 3
+	}
+	prefix := strings.Join(parts[2:insertAfter+1], "/")
+	rest := strings.Join(parts[insertAfter+1:], "/")
+	return "/registry/" + prefix + "/namespaces/" + oxiaNamespace + "/" + rest
 }
 
-// ensureNamespaceExistsWhenFirstSeen checks that the Oxia namespace exists (via Admin API) and logs a warning if not.
-// Oxia namespaces are normally created via coordinator config; this is best-effort visibility when we first see a namespace.
+// ensureNamespaceExistsWhenFirstSeen checks that the Oxia namespace exists (via Admin API).
+// If not found, tries CreateNamespace if the admin client supports it; otherwise logs a warning.
+// Oxia's standard Admin API has no CreateNamespace; namespaces are created via coordinator config
+// or OxiaNamespace CR (operator). Implementing the optional interface below allows a custom client to create namespaces.
+type namespaceCreator interface {
+	CreateNamespace(ctx context.Context, name string) error
+}
+
 func (b *Backend) ensureNamespaceExistsWhenFirstSeen(namespace string) {
 	if namespace == oxiaSystemNS {
 		return
@@ -151,7 +163,16 @@ func (b *Backend) ensureNamespaceExistsWhenFirstSeen(namespace string) {
 			return
 		}
 	}
-	logrus.Warnf("Oxia namespace %q not found in cluster. Add it to the Oxia coordinator config (see https://oxia-db.github.io/docs/features/namespaces) or the first write may fail.", namespace)
+	// Optional: if admin client can create namespaces (e.g. custom wrapper), use it.
+	if creator, ok := b.adminClient.(namespaceCreator); ok {
+		if err := creator.CreateNamespace(context.Background(), namespace); err != nil {
+			logrus.Warnf("Kine Oxia: create namespace %q failed: %v", namespace, err)
+			return
+		}
+		logrus.Infof("Kine Oxia: created Oxia namespace %q", namespace)
+		return
+	}
+	logrus.Warnf("Oxia namespace %q not found. Create it via Oxia coordinator config or an OxiaNamespace CR (see https://oxia-db.github.io/docs/features/namespaces); first write to this namespace may fail.", namespace)
 }
 
 func (b *Backend) getClient(namespace string) (oxiaclient.SyncClient, error) {
