@@ -73,6 +73,7 @@ func newBackend(ctx context.Context, dataSourceName string) (*Backend, error) {
 	baseOpts := []oxiaclient.ClientOption{
 		oxiaclient.WithRequestTimeout(30 * time.Second),
 	}
+	logrus.Infof("Kine Oxia: connecting to %s, system namespace=%s", hostPort, oxiaSystemNS)
 	systemClient, err := oxiaclient.NewSyncClient(hostPort, append(baseOpts, oxiaclient.WithNamespace(oxiaSystemNS))...)
 	if err != nil {
 		return nil, err
@@ -167,10 +168,12 @@ func (b *Backend) getClient(namespace string) (oxiaclient.SyncClient, error) {
 	}
 	// When we first see a namespace: ensure it exists in Oxia (warn if not), then create client.
 	b.ensureNamespaceExistsWhenFirstSeen(namespace)
+	logrus.Infof("Kine Oxia: using namespace %q for keys", namespace)
 	opts := append([]oxiaclient.ClientOption{}, b.baseOpts...)
 	opts = append(opts, oxiaclient.WithNamespace(namespace))
 	client, err := oxiaclient.NewSyncClient(b.hostPort, opts...)
 	if err != nil {
+		logrus.Errorf("Kine Oxia: failed to create client for namespace %q: %v", namespace, err)
 		return nil, err
 	}
 	b.clients[namespace] = client
