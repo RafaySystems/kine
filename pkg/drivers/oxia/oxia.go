@@ -66,14 +66,23 @@ type Backend struct {
 	revMu        sync.Mutex
 }
 
+// newBackend creates the Oxia backend. Connection flow:
+//   - dataSourceName is the part after "oxia://" (e.g. "host:port" or "host:port/namespace").
+//   - parseEndpoint() extracts hostPort (default port 6648 if missing) and optionally a path segment.
+//   - We create one SyncClient for oxia-system (revision + cluster-scoped keys) and optionally an AdminClient for ListNamespaces.
+//   - Per-K8s-namespace SyncClients are created on demand in getClient() using the same hostPort.
 func newBackend(ctx context.Context, dataSourceName string) (*Backend, error) {
-	hostPort, _ := parseEndpoint(dataSourceName)
+	hostPort, pathSegment := parseEndpoint(dataSourceName)
+	if pathSegment != "" {
+		logrus.Debugf("Kine Oxia: endpoint path segment %q (not used for connection; Oxia namespaces are derived from key paths)", pathSegment)
+	}
 	baseOpts := []oxiaclient.ClientOption{
 		oxiaclient.WithRequestTimeout(30 * time.Second),
 	}
-	logrus.Infof("Kine Oxia: connecting to %s, system namespace=%s", hostPort, oxiaSystemNS)
+	logrus.Infof("Kine Oxia: connecting to %s (from KINE_ENDPOINT=oxia://...), system namespace=%s", hostPort, oxiaSystemNS)
 	systemClient, err := oxiaclient.NewSyncClient(hostPort, append(baseOpts, oxiaclient.WithNamespace(oxiaSystemNS))...)
 	if err != nil {
+		logrus.Errorf("Kine Oxia: failed to create system client: %v", err)
 		return nil, err
 	}
 	b := &Backend{
@@ -84,9 +93,11 @@ func newBackend(ctx context.Context, dataSourceName string) (*Backend, error) {
 	}
 	// Optional admin client: when we first see a namespace we check/warn if it's missing in Oxia.
 	if adminClient, err := oxiaclient.NewAdminClient(hostPort, nil, nil); err == nil {
+		logrus.Infof("Kine Oxia: created admin client")
 		b.adminClient = adminClient
 	} else {
 		logrus.Debugf("Oxia admin client not available (namespace check on first use disabled): %v", err)
+		logrus.Errorf("Kine Oxia: failed to create admin client: %v", err)
 	}
 	return b, nil
 }
@@ -214,17 +225,24 @@ func (b *Backend) closeAllClients() {
 	b.clients = nil
 }
 
+// parseEndpoint parses the authority after "oxia://":
+//   - "host:port" -> (host:port, "")
+//   - "host:port/anything" -> (host:port, "anything") (path segment is logged but not used for connection)
+//   - "host" (no port) -> (host:6648, "") — Oxia default port 6648
 func parseEndpoint(endpoint string) (hostPort, namespace string) {
 	s := strings.TrimSpace(endpoint)
+	var pathPart string
 	if idx := strings.Index(s, "/"); idx >= 0 && idx+1 < len(s) {
-		return s[:idx], s[idx+1:]
+		pathPart = s[idx+1:]
+		s = s[:idx]
 	}
 	if _, _, err := net.SplitHostPort(s); err != nil {
 		if strings.Contains(err.Error(), "missing port") {
 			s = net.JoinHostPort(s, "6648")
+			logrus.Debugf("Kine Oxia: no port in endpoint, using default 6648 -> %s", s)
 		}
 	}
-	return s, ""
+	return s, pathPart
 }
 
 // Start implements server.Backend. No-op for Oxia.
@@ -264,12 +282,17 @@ func (b *Backend) nextRevision(ctx context.Context) (int64, error) {
 func (b *Backend) getRevision(ctx context.Context) (int64, error) {
 	_, data, _, err := b.systemClient.Get(ctx, revKey)
 	if err == oxiaclient.ErrKeyNotFound {
-		return 0, nil
+		// Kubernetes apiserver rejects list resource version 0 (UpdateList returns "illegal resource version from storage: 0").
+		return 1, nil
 	}
 	if err != nil || len(data) < 8 {
 		return 0, err
 	}
-	return int64(binary.BigEndian.Uint64(data)), nil
+	rev := int64(binary.BigEndian.Uint64(data))
+	if rev < 1 {
+		rev = 1
+	}
+	return rev, nil
 }
 
 func encodeValue(createRev, modRev, version, leaseID int64, value []byte) []byte {
